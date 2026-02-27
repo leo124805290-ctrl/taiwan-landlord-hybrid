@@ -80,6 +80,35 @@ async function initializeDatabase() {
       )
     `);
     
+    // 創建 audit_logs 表（登入日誌）
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        username VARCHAR(50) NOT NULL,
+        action VARCHAR(50) NOT NULL, -- 'login', 'logout', 'login_failed'
+        ip_address VARCHAR(45), -- 支持 IPv6
+        user_agent TEXT,
+        success BOOLEAN NOT NULL DEFAULT false,
+        error_message TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // 創建 user_sessions 表（會話管理）
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_sessions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        session_token VARCHAR(255) UNIQUE NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        expires_at TIMESTAMP NOT NULL,
+        last_activity TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
     console.log('資料庫表初始化完成！');
   } catch (error) {
     console.error('資料庫初始化錯誤:', error.message);
@@ -363,6 +392,20 @@ app.post(`${API_PREFIX}/auth/login`, async (req, res) => {
     );
     
     if (result.rows.length === 0) {
+      // 記錄登入失敗日誌（用戶不存在）
+      try {
+        const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+        const userAgent = req.headers['user-agent'] || '';
+        
+        await pool.query(
+          `INSERT INTO audit_logs (username, action, ip_address, user_agent, success, error_message)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [username, 'login_failed', ipAddress, userAgent, false, '用戶不存在']
+        );
+      } catch (logError) {
+        console.error('記錄登入失敗日誌失敗:', logError);
+      }
+      
       return res.status(401).json({
         success: false,
         error: '認證失敗',
@@ -375,6 +418,20 @@ app.post(`${API_PREFIX}/auth/login`, async (req, res) => {
     // 驗證密碼
     const validPassword = await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
+      // 記錄登入失敗日誌（密碼錯誤）
+      try {
+        const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+        const userAgent = req.headers['user-agent'] || '';
+        
+        await pool.query(
+          `INSERT INTO audit_logs (user_id, username, action, ip_address, user_agent, success, error_message)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [user.id, user.username, 'login_failed', ipAddress, userAgent, false, '密碼錯誤']
+        );
+      } catch (logError) {
+        console.error('記錄登入失敗日誌失敗:', logError);
+      }
+      
       return res.status(401).json({
         success: false,
         error: '認證失敗',
@@ -392,6 +449,27 @@ app.post(`${API_PREFIX}/auth/login`, async (req, res) => {
       JWT_SECRET,
       { expiresIn: '7d' }
     );
+    
+    // 記錄登入日誌
+    try {
+      const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+      const userAgent = req.headers['user-agent'] || '';
+      
+      await pool.query(
+        `INSERT INTO audit_logs (user_id, username, action, ip_address, user_agent, success)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [user.id, user.username, 'login', ipAddress, userAgent, true]
+      );
+      
+      // 更新用戶最後登入時間
+      await pool.query(
+        'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1',
+        [user.id]
+      );
+    } catch (logError) {
+      console.error('記錄登入日誌失敗:', logError);
+      // 不影響主要登入流程
+    }
     
     res.json({
       success: true,
@@ -550,7 +628,10 @@ app.get(`${API_PREFIX}/test`, async (req, res) => {
         api_docs: '/api-docs',
         auth_register: `${API_PREFIX}/auth/register`,
         auth_login: `${API_PREFIX}/auth/login`,
-        properties_list: `${API_PREFIX}/properties (需要 Token)`
+        properties_list: `${API_PREFIX}/properties (需要 Token)`,
+        admin_users_list: `${API_PREFIX}/admin/users (需要管理員權限)`,
+        admin_users_update: `${API_PREFIX}/admin/users/:id (需要管理員權限)`,
+        admin_users_disable: `${API_PREFIX}/admin/users/:id (需要管理員權限)`
       }
     });
   } catch (error) {
@@ -558,6 +639,292 @@ app.get(`${API_PREFIX}/test`, async (req, res) => {
       success: false,
       error: '測試失敗',
       message: error.message
+    });
+  }
+});
+
+// ==================== 用戶管理 API ====================
+
+// 獲取用戶列表（管理員以上）
+app.get(`${API_PREFIX}/admin/users`, authenticate, authorize('super_admin', 'admin'), async (req, res) => {
+  try {
+    const { search, role, status, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    let query = 'SELECT id, username, role, full_name, email, phone, status, last_login, created_at FROM users';
+    let conditions = [];
+    let params = [];
+    let paramCount = 0;
+    
+    // 搜索條件
+    if (search) {
+      paramCount++;
+      conditions.push(`(username ILIKE $${paramCount} OR full_name ILIKE $${paramCount})`);
+      params.push(`%${search}%`);
+    }
+    
+    if (role) {
+      paramCount++;
+      conditions.push(`role = $${paramCount}`);
+      params.push(role);
+    }
+    
+    if (status) {
+      paramCount++;
+      conditions.push(`status = $${paramCount}`);
+      params.push(status);
+    }
+    
+    // 構建 WHERE 子句
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    // 排序和分頁
+    query += ' ORDER BY created_at DESC';
+    query += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+    
+    // 執行查詢
+    const result = await pool.query(query, params);
+    
+    // 獲取總數
+    let countQuery = 'SELECT COUNT(*) as total FROM users';
+    if (conditions.length > 0) {
+      countQuery += ' WHERE ' + conditions.join(' AND ');
+    }
+    const countResult = await pool.query(countQuery, params.slice(0, paramCount));
+    const total = parseInt(countResult.rows[0].total);
+    
+    res.json({
+      success: true,
+      data: {
+        users: result.rows,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          totalPages: Math.ceil(total / limit)
+        }
+      },
+      message: '獲取用戶列表成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取用戶列表錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取用戶列表失敗'
+    });
+  }
+});
+
+// 更新用戶信息（管理員以上）
+app.put(`${API_PREFIX}/admin/users/:id`, authenticate, authorize('super_admin', 'admin'), async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const { role, status, full_name, email, phone } = req.body;
+    
+    if (!userId || isNaN(userId)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '用戶ID無效'
+      });
+    }
+    
+    // 檢查用戶是否存在
+    const userCheck = await pool.query(
+      'SELECT id, username FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: '用戶不存在',
+        message: '找不到指定的用戶'
+      });
+    }
+    
+    // 構建更新字段
+    const updates = [];
+    const params = [];
+    let paramCount = 0;
+    
+    if (role !== undefined) {
+      // 驗證角色
+      const validRoles = ['super_admin', 'admin', 'viewer'];
+      if (!validRoles.includes(role)) {
+        return res.status(400).json({
+          success: false,
+          error: '參數錯誤',
+          message: `角色必須是: ${validRoles.join(', ')}`
+        });
+      }
+      paramCount++;
+      updates.push(`role = $${paramCount}`);
+      params.push(role);
+    }
+    
+    if (status !== undefined) {
+      // 驗證狀態
+      const validStatuses = ['active', 'inactive', 'suspended'];
+      if (!validStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          error: '參數錯誤',
+          message: `狀態必須是: ${validStatuses.join(', ')}`
+        });
+      }
+      paramCount++;
+      updates.push(`status = $${paramCount}`);
+      params.push(status);
+    }
+    
+    if (full_name !== undefined) {
+      paramCount++;
+      updates.push(`full_name = $${paramCount}`);
+      params.push(full_name);
+    }
+    
+    if (email !== undefined) {
+      paramCount++;
+      updates.push(`email = $${paramCount}`);
+      params.push(email);
+    }
+    
+    if (phone !== undefined) {
+      paramCount++;
+      updates.push(`phone = $${paramCount}`);
+      params.push(phone);
+    }
+    
+    if (updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '沒有提供更新字段'
+      });
+    }
+    
+    // 添加更新時間和參數
+    paramCount++;
+    updates.push(`updated_at = CURRENT_TIMESTAMP`);
+    
+    // 添加用戶ID參數
+    paramCount++;
+    params.push(userId);
+    
+    // 執行更新
+    const query = `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING id, username, role, full_name, email, phone, status, updated_at`;
+    const result = await pool.query(query, params);
+    
+    // 記錄操作日誌
+    try {
+      await pool.query(
+        `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [req.user.userId, 'update', 'user', userId, JSON.stringify({ updates })]
+      );
+    } catch (logError) {
+      console.error('記錄操作日誌失敗:', logError);
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        user: result.rows[0]
+      },
+      message: '更新用戶成功'
+    });
+    
+  } catch (error) {
+    console.error('更新用戶錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '更新用戶失敗'
+    });
+  }
+});
+
+// 禁用/啟用用戶（管理員以上）
+app.delete(`${API_PREFIX}/admin/users/:id`, authenticate, authorize('super_admin', 'admin'), async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    
+    if (!userId || isNaN(userId)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '用戶ID無效'
+      });
+    }
+    
+    // 檢查用戶是否存在
+    const userCheck = await pool.query(
+      'SELECT id, username, status FROM users WHERE id = $1',
+      [userId]
+    );
+    
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: '用戶不存在',
+        message: '找不到指定的用戶'
+      });
+    }
+    
+    const user = userCheck.rows[0];
+    
+    // 不能禁用自己
+    if (userId === req.user.userId) {
+      return res.status(400).json({
+        success: false,
+        error: '操作不允許',
+        message: '不能禁用自己的帳號'
+      });
+    }
+    
+    // 切換狀態
+    const newStatus = user.status === 'active' ? 'inactive' : 'active';
+    const action = newStatus === 'inactive' ? 'disable' : 'enable';
+    
+    const result = await pool.query(
+      `UPDATE users SET status = $1, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $2 
+       RETURNING id, username, role, status`,
+      [newStatus, userId]
+    );
+    
+    // 記錄操作日誌
+    try {
+      await pool.query(
+        `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [req.user.userId, action, 'user', userId, JSON.stringify({ old_status: user.status, new_status: newStatus })]
+      );
+    } catch (logError) {
+      console.error('記錄操作日誌失敗:', logError);
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        user: result.rows[0],
+        action: action
+      },
+      message: `用戶已${newStatus === 'inactive' ? '禁用' : '啟用'}`
+    });
+    
+  } catch (error) {
+    console.error('更新用戶狀態錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '更新用戶狀態失敗'
     });
   }
 });
