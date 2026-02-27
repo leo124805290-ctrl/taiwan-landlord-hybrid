@@ -1,3 +1,35 @@
+      message: '獲取物業列表成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取物業列表錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取物業列表失敗'
+    });
+  }
+});
+
+// 404 處理
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Not Found',
+    message: `找不到路徑: ${req.path}`
+  });
+});
+
+// 錯誤處理
+app.use((err, req, res, next) => {
+  console.error('伺服器錯誤:', err);
+  res.status(500).json({
+    success: false,
+    error: 'Internal Server Error',
+    message: '伺服器內部錯誤'
+  });
+});
+
 // 啟動伺服器
 app.listen(port, () => {
   console.log(`🚀 混合版本伺服器啟動！`);
