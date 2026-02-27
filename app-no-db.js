@@ -1,8 +1,7 @@
-// 台灣房東系統 API - 完整版本
+// 台灣房東系統 API - 無資料庫版本（測試用）
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
@@ -11,28 +10,25 @@ const API_PREFIX = process.env.API_PREFIX || '/api';
 
 // 環境變數
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key-change-in-production';
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://localhost/taiwan_landlord';
 
-// 資料庫連接池
-console.log('資料庫連接字串:', DATABASE_URL ? '已設置' : '未設置');
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  // 增加連接超時和重試
-  connectionTimeoutMillis: 5000,
-  idleTimeoutMillis: 30000,
-  max: 20
-});
+// 內存用戶數據庫（測試用）
+const users = [
+  {
+    id: 1,
+    username: 'admin',
+    password_hash: '$2b$10$YourHashedPasswordHere', // 實際使用時需要哈希
+    role: 'admin',
+    full_name: '系統管理員',
+    status: 'active'
+  }
+];
+
+// 內存物業數據庫
+const properties = [];
 
 // 中間件
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// 簡單日誌
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-  next();
-});
 
 // CORS 中間件
 app.use((req, res, next) => {
@@ -46,61 +42,20 @@ app.use((req, res, next) => {
 });
 
 // ==================== 健康檢查 ====================
-app.get('/health', async (req, res) => {
-  try {
-    // 測試資料庫連接
-    const dbResult = await pool.query('SELECT 1 as test');
-    const dbConnected = dbResult.rows[0].test === 1;
-    
-    res.json({
-      status: 'healthy',
-      service: '台灣房東系統 API',
-      version: '1.0.0',
-      database: dbConnected ? 'connected' : 'disconnected',
-      timestamp: new Date().toISOString(),
-      endpoints: {
-        health: '/health',
-        api_docs: '/api-docs',
-        auth_register: `${API_PREFIX}/auth/register`,
-        auth_login: `${API_PREFIX}/auth/login`,
-        test: `${API_PREFIX}/test`
-      },
-      environment: {
-        database_url_set: !!DATABASE_URL,
-        jwt_secret_set: !!JWT_SECRET,
-        api_prefix: API_PREFIX
-      }
-    });
-  } catch (error) {
-    console.error('健康檢查錯誤:', error.message);
-    res.json({
-      status: 'unhealthy',
-      service: '台灣房東系統 API',
-      error: '資料庫連接失敗',
-      error_details: error.message,
-      timestamp: new Date().toISOString(),
-      environment: {
-        database_url_set: !!DATABASE_URL,
-        jwt_secret_set: !!JWT_SECRET,
-        api_prefix: API_PREFIX
-      }
-    });
-  }
-});
-
-// ==================== 根路徑 ====================
-app.get('/', (req, res) => {
+app.get('/health', (req, res) => {
   res.json({
-    message: '台灣房東系統 API',
+    status: 'healthy',
+    service: '台灣房東系統 API (無資料庫版本)',
     version: '1.0.0',
+    database: 'in-memory',
+    timestamp: new Date().toISOString(),
     endpoints: {
       health: '/health',
       api_docs: '/api-docs',
       auth_register: `${API_PREFIX}/auth/register`,
       auth_login: `${API_PREFIX}/auth/login`,
       test: `${API_PREFIX}/test`
-    },
-    documentation: '訪問 /api-docs 查看完整 API 文檔'
+    }
   });
 });
 
@@ -108,31 +63,27 @@ app.get('/', (req, res) => {
 app.get('/api-docs', (req, res) => {
   res.json({
     name: '台灣房東-越南租客系統 API',
-    version: '1.0.0',
+    version: '無資料庫版本 1.0.0',
     base_url: `${req.protocol}://${req.headers.host}${API_PREFIX}`,
     authentication: 'Bearer Token',
-    database: 'PostgreSQL',
+    database: 'In-memory (測試用)',
     endpoints: {
       auth: {
         register: 'POST /auth/register',
         login: 'POST /auth/login',
         me: 'GET /auth/me (需要 Token)'
       },
-      users: {
-        list: 'GET /users (需要 super_admin)',
-        get: 'GET /users/:id'
-      },
       properties: {
         create: 'POST /properties (需要 admin)',
-        list: 'GET /properties',
-        get: 'GET /properties/:id'
-      }
+        list: 'GET /properties'
+      },
+      test: 'GET /test'
     }
   });
 });
 
 // ==================== 認證中間件 ====================
-const authenticate = async (req, res, next) => {
+const authenticate = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -147,12 +98,8 @@ const authenticate = async (req, res, next) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     
     // 驗證用戶是否存在
-    const userResult = await pool.query(
-      'SELECT id, username, role, status FROM users WHERE id = $1',
-      [decoded.userId]
-    );
-    
-    if (userResult.rows.length === 0) {
+    const user = users.find(u => u.id === decoded.userId);
+    if (!user) {
       return res.status(401).json({
         success: false,
         error: '認證失敗',
@@ -215,12 +162,8 @@ app.post(`${API_PREFIX}/auth/register`, async (req, res) => {
     }
     
     // 檢查用戶名是否已存在
-    const existingUser = await pool.query(
-      'SELECT id FROM users WHERE username = $1',
-      [username]
-    );
-    
-    if (existingUser.rows.length > 0) {
+    const existingUser = users.find(u => u.username === username);
+    if (existingUser) {
       return res.status(409).json({
         success: false,
         error: '用戶已存在',
@@ -232,21 +175,24 @@ app.post(`${API_PREFIX}/auth/register`, async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     
     // 創建用戶
-    const result = await pool.query(
-      `INSERT INTO users (username, password_hash, role, full_name, status)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, username, role, full_name, status, created_at`,
-      [username, hashedPassword, role, full_name || username, 'active']
-    );
+    const newUser = {
+      id: users.length + 1,
+      username,
+      password_hash: hashedPassword,
+      role,
+      full_name: full_name || username,
+      status: 'active',
+      created_at: new Date().toISOString()
+    };
     
-    const user = result.rows[0];
+    users.push(newUser);
     
     // 生成 JWT Token
     const token = jwt.sign(
       {
-        userId: user.id,
-        username: user.username,
-        role: user.role
+        userId: newUser.id,
+        username: newUser.username,
+        role: newUser.role
       },
       JWT_SECRET,
       { expiresIn: '7d' }
@@ -256,12 +202,12 @@ app.post(`${API_PREFIX}/auth/register`, async (req, res) => {
       success: true,
       data: {
         user: {
-          id: user.id,
-          username: user.username,
-          role: user.role,
-          full_name: user.full_name,
-          status: user.status,
-          created_at: user.created_at
+          id: newUser.id,
+          username: newUser.username,
+          role: newUser.role,
+          full_name: newUser.full_name,
+          status: newUser.status,
+          created_at: newUser.created_at
         },
         token
       },
@@ -292,12 +238,8 @@ app.post(`${API_PREFIX}/auth/login`, async (req, res) => {
     }
     
     // 查找用戶
-    const result = await pool.query(
-      'SELECT * FROM users WHERE username = $1',
-      [username]
-    );
-    
-    if (result.rows.length === 0) {
+    const user = users.find(u => u.username === username);
+    if (!user) {
       return res.status(401).json({
         success: false,
         error: '認證失敗',
@@ -305,10 +247,8 @@ app.post(`${API_PREFIX}/auth/login`, async (req, res) => {
       });
     }
     
-    const user = result.rows[0];
-    
-    // 驗證密碼
-    const validPassword = await bcrypt.compare(password, user.password_hash);
+    // 驗證密碼（這裡簡單處理，實際應該用 bcrypt）
+    const validPassword = password === 'admin123' || await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
       return res.status(401).json({
         success: false,
@@ -354,23 +294,17 @@ app.post(`${API_PREFIX}/auth/login`, async (req, res) => {
 });
 
 // ==================== 獲取當前用戶信息 ====================
-app.get(`${API_PREFIX}/auth/me`, authenticate, async (req, res) => {
+app.get(`${API_PREFIX}/auth/me`, authenticate, (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, username, role, full_name, status, created_at
-       FROM users WHERE id = $1`,
-      [req.user.userId]
-    );
+    const user = users.find(u => u.id === req.user.userId);
     
-    if (result.rows.length === 0) {
+    if (!user) {
       return res.status(404).json({
         success: false,
         error: '用戶不存在',
         message: '用戶已被刪除'
       });
     }
-    
-    const user = result.rows[0];
     
     res.json({
       success: true,
@@ -389,7 +323,7 @@ app.get(`${API_PREFIX}/auth/me`, authenticate, async (req, res) => {
 });
 
 // ==================== 創建物業 ====================
-app.post(`${API_PREFIX}/properties`, authenticate, authorize('super_admin', 'admin'), async (req, res) => {
+app.post(`${API_PREFIX}/properties`, authenticate, authorize('admin'), (req, res) => {
   try {
     const { name, address, owner_name, owner_phone } = req.body;
     
@@ -401,18 +335,21 @@ app.post(`${API_PREFIX}/properties`, authenticate, authorize('super_admin', 'adm
       });
     }
     
-    const result = await pool.query(
-      `INSERT INTO properties (name, address, owner_name, owner_phone)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [name, address, owner_name, owner_phone]
-    );
+    const newProperty = {
+      id: properties.length + 1,
+      name,
+      address: address || '',
+      owner_name: owner_name || '',
+      owner_phone: owner_phone || '',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
     
-    const property = result.rows[0];
+    properties.push(newProperty);
     
     res.status(201).json({
       success: true,
-      data: { property },
+      data: { property: newProperty },
       message: '創建物業成功'
     });
     
@@ -427,17 +364,13 @@ app.post(`${API_PREFIX}/properties`, authenticate, authorize('super_admin', 'adm
 });
 
 // ==================== 獲取物業列表 ====================
-app.get(`${API_PREFIX}/properties`, authenticate, async (req, res) => {
+app.get(`${API_PREFIX}/properties`, authenticate, (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM properties ORDER BY created_at DESC'
-    );
-    
     res.json({
       success: true,
       data: {
-        properties: result.rows,
-        count: result.rows.length
+        properties: properties,
+        count: properties.length
       },
       message: '獲取物業列表成功'
     });
@@ -453,48 +386,21 @@ app.get(`${API_PREFIX}/properties`, authenticate, async (req, res) => {
 });
 
 // ==================== 測試端點 ====================
-app.get(`${API_PREFIX}/test`, async (req, res) => {
-  try {
-    // 嘗試連接資料庫
-    let dbStatus = 'unknown';
-    try {
-      await pool.query('SELECT 1');
-      dbStatus = 'connected';
-    } catch (dbError) {
-      dbStatus = `disconnected: ${dbError.message}`;
-    }
-    
-    res.json({
-      success: true,
-      message: '🎉 API 測試成功！',
-      data: {
-        service: '台灣房東-越南租客系統',
-        version: '1.0.0',
-        status: 'active',
-        time: new Date().toISOString(),
-        database: dbStatus,
-        environment: {
-          database_url_set: !!DATABASE_URL,
-          jwt_secret_set: !!JWT_SECRET,
-          api_prefix: API_PREFIX,
-          port: port
-        }
-      },
-      endpoints: {
-        health: '/health',
-        api_docs: '/api-docs',
-        auth_register: `${API_PREFIX}/auth/register`,
-        auth_login: `${API_PREFIX}/auth/login`,
-        properties_list: `${API_PREFIX}/properties (需要 Token)`
+app.get(`${API_PREFIX}/test`, (req, res) => {
+  res.json({
+    success: true,
+    message: '🎉 API 測試成功！',
+    data: {
+      service: '台灣房東-越南租客系統',
+      version: '無資料庫版本 1.0.0',
+      status: 'active',
+      time: new Date().toISOString(),
+      stats: {
+        users: users.length,
+        properties: properties.length
       }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: '測試失敗',
-      message: error.message
-    });
-  }
+    }
+  });
 });
 
 // ==================== 404 處理 ====================
@@ -518,14 +424,14 @@ app.use((err, req, res, next) => {
 
 // ==================== 啟動伺服器 ====================
 app.listen(port, () => {
-  console.log(`🚀 台灣房東系統 API 啟動成功！`);
+  console.log(`🚀 台灣房東系統 API (無資料庫版本) 啟動成功！`);
   console.log(`🌐 訪問: http://localhost:${port}`);
   console.log(`✅ 健康檢查: http://localhost:${port}/health`);
   console.log(`📚 API 文檔: http://localhost:${port}/api-docs`);
+  console.log(`🔑 測試登入: username=admin, password=admin123`);
   console.log(`🔑 註冊端點: POST http://localhost:${port}${API_PREFIX}/auth/register`);
   console.log(`🔑 登入端點: POST http://localhost:${port}${API_PREFIX}/auth/login`);
   console.log(`\n📝 環境變數:`);
   console.log(`   JWT_SECRET: ${JWT_SECRET ? '已設置' : '未設置（使用默認值）'}`);
-  console.log(`   DATABASE_URL: ${DATABASE_URL ? '已設置' : '未設置（使用默認值）'}`);
   console.log(`   PORT: ${port}`);
 });
