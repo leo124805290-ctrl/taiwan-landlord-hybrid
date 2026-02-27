@@ -15,14 +15,22 @@ const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://localhost/taiwan_
 
 // 資料庫連接池
 console.log('資料庫連接字串:', DATABASE_URL ? '已設置' : '未設置');
-const pool = new Pool({
+const poolConfig = {
   connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  // Zeabur 的 PostgreSQL 可能不支持 SSL，所以禁用 SSL
+  ssl: false,
   // 增加連接超時和重試
   connectionTimeoutMillis: 5000,
   idleTimeoutMillis: 30000,
   max: 20
-});
+};
+
+// 如果是本地開發，可以啟用 SSL
+if (process.env.NODE_ENV === 'production' && DATABASE_URL && DATABASE_URL.includes('amazonaws.com')) {
+  poolConfig.ssl = { rejectUnauthorized: false };
+}
+
+const pool = new Pool(poolConfig);
 
 // 中間件
 app.use(express.json());
