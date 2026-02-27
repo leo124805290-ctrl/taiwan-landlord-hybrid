@@ -32,6 +32,63 @@ if (process.env.NODE_ENV === 'production' && DATABASE_URL && DATABASE_URL.includ
 
 const pool = new Pool(poolConfig);
 
+// 自動創建資料庫表（如果不存在）
+async function initializeDatabase() {
+  try {
+    console.log('正在初始化資料庫表...');
+    
+    // 創建 users 表
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'viewer',
+        full_name VARCHAR(100),
+        email VARCHAR(100),
+        phone VARCHAR(20),
+        status VARCHAR(20) NOT NULL DEFAULT 'active',
+        last_login TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // 創建 properties 表
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS properties (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        address TEXT,
+        owner_name VARCHAR(100),
+        owner_phone VARCHAR(20),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // 創建 operation_logs 表
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS operation_logs (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        action_type VARCHAR(50) NOT NULL,
+        resource_type VARCHAR(50) NOT NULL,
+        resource_id INTEGER,
+        details JSONB,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    console.log('資料庫表初始化完成！');
+  } catch (error) {
+    console.error('資料庫初始化錯誤:', error.message);
+  }
+}
+
+// 啟動時初始化資料庫
+initializeDatabase();
+
 // 中間件
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
