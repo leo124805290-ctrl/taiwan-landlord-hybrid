@@ -525,15 +525,18 @@ app.use((err, req, res, next) => {
 });
 
 // ==================== 啟動伺服器 ====================
-app.listen(port, () => {
+// Zeabur 需要監聽 0.0.0.0 而不是 localhost
+const host = '0.0.0.0';
+app.listen(port, host, () => {
   console.log(`🚀 台灣房東系統 API 啟動成功！`);
-  console.log(`🌐 訪問: http://localhost:${port}`);
-  console.log(`✅ 健康檢查: http://localhost:${port}/health`);
-  console.log(`📚 API 文檔: http://localhost:${port}/api-docs`);
-  console.log(`🔑 註冊端點: POST http://localhost:${port}${API_PREFIX}/auth/register`);
-  console.log(`🔑 登入端點: POST http://localhost:${port}${API_PREFIX}/auth/login`);
+  console.log(`🌐 監聽: ${host}:${port}`);
+  console.log(`✅ 健康檢查: http://${host}:${port}/health`);
+  console.log(`📚 API 文檔: http://${host}:${port}/api-docs`);
+  console.log(`🔑 註冊端點: POST http://${host}:${port}${API_PREFIX}/auth/register`);
+  console.log(`🔑 登入端點: POST http://${host}:${port}${API_PREFIX}/auth/login`);
   console.log(`\n📝 環境變數:`);
   console.log(`   JWT_SECRET: ${JWT_SECRET ? '已設置' : '未設置（使用默認值）'}`);
   console.log(`   DATABASE_URL: ${DATABASE_URL ? '已設置' : '未設置（使用默認值）'}`);
   console.log(`   PORT: ${port}`);
+  console.log(`   HOST: ${host}`);
 });
