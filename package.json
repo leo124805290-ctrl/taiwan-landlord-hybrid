@@ -1,0 +1,20 @@
+{
+  "name": "taiwan-landlord-hybrid",
+  "version": "1.0.0",
+  "description": "台灣房東系統 - 混合版本（JavaScript 實現完整功能）",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
