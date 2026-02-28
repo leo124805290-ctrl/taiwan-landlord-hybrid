@@ -1489,7 +1489,7 @@ app.get(`${API_PREFIX}/backups/stats`, authenticate, authorize('admin', 'super_a
     const stats = statsResult.rows[0];
     
     // 計算人類可讀的大小
-    const formatSize = (bytes: number) => {
+    const formatSize = (bytes) => {
       if (bytes < 1024) return `${bytes} B`;
       if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
       if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
@@ -2101,14 +2101,7 @@ app.get(`${API_PREFIX}/notifications`, authenticate, async (req, res) => {
       query += ' AND ' + conditions.join(' AND ');
     }
     
-    query += ' ORDER BY 
-      CASE n.priority 
-        WHEN \'urgent\' THEN 1
-        WHEN \'high\' THEN 2
-        WHEN \'medium\' THEN 3
-        WHEN \'low\' THEN 4
-      END,
-      n.created_at DESC';
+    query += ' ORDER BY CASE n.priority WHEN \'urgent\' THEN 1 WHEN \'high\' THEN 2 WHEN \'medium\' THEN 3 WHEN \'low\' THEN 4 END, n.created_at DESC';
     
     query += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
     params.push(limit, offset);
