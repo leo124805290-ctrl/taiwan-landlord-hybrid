@@ -109,6 +109,43 @@ async function initializeDatabase() {
       )
     `);
     
+    // 創建 settings 表（系統設置）
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        id SERIAL PRIMARY KEY,
+        key VARCHAR(100) UNIQUE NOT NULL,
+        value TEXT,
+        category VARCHAR(50) NOT NULL DEFAULT 'general',
+        description TEXT,
+        updated_by INTEGER REFERENCES users(id),
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // 插入默認設置
+    const defaultSettings = [
+      { key: 'system_name', value: '台灣房東系統', category: 'general', description: '系統名稱' },
+      { key: 'system_language', value: 'zh-TW', category: 'general', description: '默認語言' },
+      { key: 'timezone', value: 'Asia/Taipei', category: 'general', description: '時區' },
+      { key: 'date_format', value: 'YYYY-MM-DD', category: 'general', description: '日期格式' },
+      { key: 'currency_format', value: 'TWD', category: 'general', description: '貨幣格式' },
+      { key: 'password_min_length', value: '6', category: 'security', description: '密碼最小長度' },
+      { key: 'session_timeout_hours', value: '24', category: 'security', description: '會話超時時間（小時）' },
+      { key: 'login_attempt_limit', value: '5', category: 'security', description: '登入嘗試限制' },
+      { key: 'backup_retention_days', value: '30', category: 'backup', description: '備份保留天數' },
+      { key: 'auto_backup_enabled', value: 'true', category: 'backup', description: '自動備份啟用' },
+      { key: 'notification_enabled', value: 'true', category: 'notification', description: '通知啟用' }
+    ];
+    
+    for (const setting of defaultSettings) {
+      await pool.query(`
+        INSERT INTO settings (key, value, category, description)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (key) DO NOTHING
+      `, [setting.key, setting.value, setting.category, setting.description]);
+    }
+    
     console.log('資料庫表初始化完成！');
   } catch (error) {
     console.error('資料庫初始化錯誤:', error.message);
@@ -925,6 +962,174 @@ app.delete(`${API_PREFIX}/admin/users/:id`, authenticate, authorize('super_admin
       success: false,
       error: '伺服器錯誤',
       message: '更新用戶狀態失敗'
+    });
+  }
+});
+
+// ==================== 系統設置 API ====================
+
+// 獲取所有系統設置（管理員以上）
+app.get(`${API_PREFIX}/settings`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { category } = req.query;
+    
+    let query = 'SELECT * FROM settings';
+    let params = [];
+    
+    if (category) {
+      query += ' WHERE category = $1';
+      params.push(category);
+    }
+    
+    query += ' ORDER BY category, key';
+    
+    const result = await pool.query(query, params);
+    
+    // 將結果轉換為對象格式
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.key] = {
+        value: row.value,
+        category: row.category,
+        description: row.description,
+        updated_at: row.updated_at
+      };
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        settings,
+        count: result.rows.length
+      },
+      message: '獲取系統設置成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取系統設置錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取系統設置失敗'
+    });
+  }
+});
+
+// 更新系統設置（管理員以上）
+app.put(`${API_PREFIX}/settings`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { settings } = req.body;
+    
+    if (!settings || typeof settings !== 'object') {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '需要提供設置對象'
+      });
+    }
+    
+    const updatedSettings = [];
+    const errors = [];
+    
+    // 遍歷所有要更新的設置
+    for (const [key, valueObj] of Object.entries(settings)) {
+      try {
+        const value = typeof valueObj === 'object' ? valueObj.value : valueObj;
+        
+        // 檢查設置是否存在
+        const checkResult = await pool.query(
+          'SELECT id FROM settings WHERE key = $1',
+          [key]
+        );
+        
+        if (checkResult.rows.length === 0) {
+          errors.push(`設置 ${key} 不存在`);
+          continue;
+        }
+        
+        // 更新設置
+        const result = await pool.query(
+          `UPDATE settings 
+           SET value = $1, updated_by = $2, updated_at = CURRENT_TIMESTAMP
+           WHERE key = $3
+           RETURNING key, value, category, description, updated_at`,
+          [value, req.user.userId, key]
+        );
+        
+        updatedSettings.push(result.rows[0]);
+        
+        // 記錄操作日誌
+        await pool.query(
+          `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [req.user.userId, 'update', 'setting', checkResult.rows[0].id, 
+           JSON.stringify({ key, old_value: checkResult.rows[0].value, new_value: value })]
+        );
+        
+      } catch (updateError) {
+        console.error(`更新設置 ${key} 錯誤:`, updateError);
+        errors.push(`更新 ${key} 失敗: ${updateError.message}`);
+      }
+    }
+    
+    if (errors.length > 0 && updatedSettings.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: '更新失敗',
+        message: errors.join(', ')
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        updated: updatedSettings,
+        errors: errors.length > 0 ? errors : undefined
+      },
+      message: `成功更新 ${updatedSettings.length} 個設置${errors.length > 0 ? `，${errors.length} 個失敗` : ''}`
+    });
+    
+  } catch (error) {
+    console.error('更新系統設置錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '更新系統設置失敗'
+    });
+  }
+});
+
+// 獲取特定類別的設置
+app.get(`${API_PREFIX}/settings/:category`, authenticate, async (req, res) => {
+  try {
+    const { category } = req.params;
+    
+    const result = await pool.query(
+      'SELECT key, value, description FROM settings WHERE category = $1 ORDER BY key',
+      [category]
+    );
+    
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.key] = row.value;
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        category,
+        settings,
+        count: result.rows.length
+      },
+      message: '獲取設置成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取類別設置錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取設置失敗'
     });
   }
 });
