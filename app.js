@@ -1500,6 +1500,451 @@ app.get(`${API_PREFIX}/backups/stats`, authenticate, authorize('admin', 'super_a
   }
 });
 
+// ==================== 登入日誌 API ====================
+
+// 獲取登入日誌（管理員以上）
+app.get(`${API_PREFIX}/logs/login`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { 
+      user_id, 
+      username, 
+      action, 
+      success, 
+      start_date, 
+      end_date, 
+      page = 1, 
+      limit = 50 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    
+    let query = `
+      SELECT al.*, u.username as user_username, u.role as user_role
+      FROM audit_logs al
+      LEFT JOIN users u ON al.user_id = u.id
+    `;
+    
+    let conditions = [];
+    let params = [];
+    let paramCount = 0;
+    
+    if (user_id) {
+      paramCount++;
+      conditions.push(`al.user_id = $${paramCount}`);
+      params.push(user_id);
+    }
+    
+    if (username) {
+      paramCount++;
+      conditions.push(`al.username ILIKE $${paramCount}`);
+      params.push(`%${username}%`);
+    }
+    
+    if (action) {
+      paramCount++;
+      conditions.push(`al.action = $${paramCount}`);
+      params.push(action);
+    }
+    
+    if (success !== undefined) {
+      paramCount++;
+      conditions.push(`al.success = $${paramCount}`);
+      params.push(success === 'true');
+    }
+    
+    if (start_date) {
+      paramCount++;
+      conditions.push(`al.created_at >= $${paramCount}`);
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      paramCount++;
+      conditions.push(`al.created_at <= $${paramCount}`);
+      params.push(end_date);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY al.created_at DESC';
+    query += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+    
+    // 執行查詢
+    const result = await pool.query(query, params);
+    
+    // 獲取總數
+    let countQuery = 'SELECT COUNT(*) as total FROM audit_logs al';
+    if (conditions.length > 0) {
+      countQuery += ' WHERE ' + conditions.join(' AND ');
+    }
+    const countResult = await pool.query(countQuery, params.slice(0, paramCount));
+    const total = parseInt(countResult.rows[0].total);
+    
+    // 統計信息
+    const statsResult = await pool.query(`
+      SELECT 
+        COUNT(*) as total_logs,
+        COUNT(CASE WHEN action = 'login' AND success = true THEN 1 END) as successful_logins,
+        COUNT(CASE WHEN action = 'login' AND success = false THEN 1 END) as failed_logins,
+        COUNT(CASE WHEN action = 'logout' THEN 1 END) as logouts,
+        COUNT(CASE WHEN action = 'login_failed' THEN 1 END) as login_failures,
+        COUNT(DISTINCT user_id) as unique_users,
+        COUNT(DISTINCT ip_address) as unique_ips,
+        MIN(created_at) as first_login,
+        MAX(created_at) as last_login
+      FROM audit_logs
+    `);
+    
+    const stats = statsResult.rows[0];
+    
+    // 最近24小時活動統計
+    const recentStatsResult = await pool.query(`
+      SELECT 
+        COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END) as last_24h,
+        COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days' THEN 1 END) as last_7d,
+        COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 1 END) as last_30d
+      FROM audit_logs
+    `);
+    
+    const recentStats = recentStatsResult.rows[0];
+    
+    res.json({
+      success: true,
+      data: {
+        logs: result.rows,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          totalPages: Math.ceil(total / limit)
+        },
+        stats: {
+          ...stats,
+          recent: recentStats
+        }
+      },
+      message: '獲取登入日誌成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取登入日誌錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取登入日誌失敗'
+    });
+  }
+});
+
+// 獲取操作日誌（管理員以上）
+app.get(`${API_PREFIX}/logs/operation`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { 
+      user_id, 
+      action_type, 
+      resource_type, 
+      start_date, 
+      end_date, 
+      page = 1, 
+      limit = 50 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    
+    let query = `
+      SELECT ol.*, u.username, u.role, u.email
+      FROM operation_logs ol
+      LEFT JOIN users u ON ol.user_id = u.id
+    `;
+    
+    let conditions = [];
+    let params = [];
+    let paramCount = 0;
+    
+    if (user_id) {
+      paramCount++;
+      conditions.push(`ol.user_id = $${paramCount}`);
+      params.push(user_id);
+    }
+    
+    if (action_type) {
+      paramCount++;
+      conditions.push(`ol.action_type = $${paramCount}`);
+      params.push(action_type);
+    }
+    
+    if (resource_type) {
+      paramCount++;
+      conditions.push(`ol.resource_type = $${paramCount}`);
+      params.push(resource_type);
+    }
+    
+    if (start_date) {
+      paramCount++;
+      conditions.push(`ol.created_at >= $${paramCount}`);
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      paramCount++;
+      conditions.push(`ol.created_at <= $${paramCount}`);
+      params.push(end_date);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY ol.created_at DESC';
+    query += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+    
+    // 執行查詢
+    const result = await pool.query(query, params);
+    
+    // 獲取總數
+    let countQuery = 'SELECT COUNT(*) as total FROM operation_logs ol';
+    if (conditions.length > 0) {
+      countQuery += ' WHERE ' + conditions.join(' AND ');
+    }
+    const countResult = await pool.query(countQuery, params.slice(0, paramCount));
+    const total = parseInt(countResult.rows[0].total);
+    
+    // 統計信息
+    const statsResult = await pool.query(`
+      SELECT 
+        COUNT(*) as total_operations,
+        COUNT(DISTINCT user_id) as active_users,
+        COUNT(DISTINCT action_type) as unique_action_types,
+        COUNT(DISTINCT resource_type) as unique_resource_types,
+        MIN(created_at) as first_operation,
+        MAX(created_at) as last_operation
+      FROM operation_logs
+    `);
+    
+    const stats = statsResult.rows[0];
+    
+    // 操作類型統計
+    const actionStatsResult = await pool.query(`
+      SELECT 
+        action_type,
+        COUNT(*) as count,
+        COUNT(DISTINCT user_id) as users,
+        MIN(created_at) as first_time,
+        MAX(created_at) as last_time
+      FROM operation_logs
+      GROUP BY action_type
+      ORDER BY count DESC
+      LIMIT 10
+    `);
+    
+    const actionStats = actionStatsResult.rows;
+    
+    res.json({
+      success: true,
+      data: {
+        logs: result.rows,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          totalPages: Math.ceil(total / limit)
+        },
+        stats: {
+          ...stats,
+          action_types: actionStats
+        }
+      },
+      message: '獲取操作日誌成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取操作日誌錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取操作日誌失敗'
+    });
+  }
+});
+
+// 清除舊日誌（超級管理員）
+app.delete(`${API_PREFIX}/logs/cleanup`, authenticate, authorize('super_admin'), async (req, res) => {
+  try {
+    const { days = 90 } = req.query;
+    const retentionDays = parseInt(days);
+    
+    if (isNaN(retentionDays) || retentionDays < 7) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '保留天數必須大於等於7天'
+      });
+    }
+    
+    // 清除舊的登入日誌
+    const auditDeleteResult = await pool.query(
+      `DELETE FROM audit_logs WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days' RETURNING COUNT(*) as deleted_count`
+    );
+    
+    const auditDeleted = parseInt(auditDeleteResult.rows[0].deleted_count);
+    
+    // 清除舊的操作日誌
+    const operationDeleteResult = await pool.query(
+      `DELETE FROM operation_logs WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days' RETURNING COUNT(*) as deleted_count`
+    );
+    
+    const operationDeleted = parseInt(operationDeleteResult.rows[0].deleted_count);
+    
+    // 記錄清理操作
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, details)
+       VALUES ($1, $2, $3, $4)`,
+      [req.user.userId, 'cleanup', 'logs', 
+       JSON.stringify({ 
+         retention_days: retentionDays, 
+         audit_logs_deleted: auditDeleted,
+         operation_logs_deleted: operationDeleted 
+       })]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        audit_logs_deleted: auditDeleted,
+        operation_logs_deleted: operationDeleted,
+        total_deleted: auditDeleted + operationDeleted,
+        retention_days: retentionDays
+      },
+      message: `已清除 ${auditDeleted + operationDeleted} 條舊日誌（保留最近 ${retentionDays} 天）`
+    });
+    
+  } catch (error) {
+    console.error('清除日誌錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '清除日誌失敗'
+    });
+  }
+});
+
+// 導出日誌（管理員以上）
+app.get(`${API_PREFIX}/logs/export`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { type, format = 'json', start_date, end_date } = req.query;
+    
+    if (!type || !['login', 'operation'].includes(type)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '日誌類型必須是 login 或 operation'
+      });
+    }
+    
+    let query;
+    let filename;
+    
+    if (type === 'login') {
+      query = `
+        SELECT al.*, u.username as user_username, u.role as user_role
+        FROM audit_logs al
+        LEFT JOIN users u ON al.user_id = u.id
+      `;
+      filename = `login_logs_${new Date().toISOString().split('T')[0]}`;
+    } else {
+      query = `
+        SELECT ol.*, u.username, u.role, u.email
+        FROM operation_logs ol
+        LEFT JOIN users u ON ol.user_id = u.id
+      `;
+      filename = `operation_logs_${new Date().toISOString().split('T')[0]}`;
+    }
+    
+    let conditions = [];
+    let params = [];
+    let paramCount = 0;
+    
+    if (start_date) {
+      paramCount++;
+      conditions.push(`created_at >= $${paramCount}`);
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      paramCount++;
+      conditions.push(`created_at <= $${paramCount}`);
+      params.push(end_date);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    const result = await pool.query(query, params);
+    
+    // 記錄導出操作
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, details)
+       VALUES ($1, $2, $3, $4)`,
+      [req.user.userId, 'export', 'logs', 
+       JSON.stringify({ 
+         log_type: type, 
+         format: format,
+         record_count: result.rows.length,
+         date_range: { start_date, end_date }
+       })]
+    );
+    
+    if (format === 'csv') {
+      // CSV 格式導出
+      const headers = Object.keys(result.rows[0] || {}).join(',');
+      const rows = result.rows.map(row => 
+        Object.values(row).map(value => 
+          typeof value === 'string' ? `"${value.replace(/"/g, '""')}"` : value
+        ).join(',')
+      ).join('\n');
+      
+      const csvContent = `${headers}\n${rows}`;
+      
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`);
+      res.send(csvContent);
+      
+    } else {
+      // JSON 格式導出（默認）
+      res.json({
+        success: true,
+        data: {
+          logs: result.rows,
+          metadata: {
+            type,
+            format,
+            count: result.rows.length,
+            exported_at: new Date().toISOString(),
+            exported_by: req.user.userId,
+            date_range: { start_date, end_date }
+          }
+        },
+        message: '日誌導出成功'
+      });
+    }
+    
+  } catch (error) {
+    console.error('導出日誌錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '導出日誌失敗'
+    });
+  }
+});
+
 // ==================== 404 處理 ====================
 app.use((req, res) => {
   res.status(404).json({
