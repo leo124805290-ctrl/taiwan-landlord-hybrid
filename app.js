@@ -123,6 +123,25 @@ async function initializeDatabase() {
       )
     `);
     
+    // 創建 backup_logs 表（數據備份記錄）
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS backup_logs (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description TEXT,
+        file_size BIGINT,
+        record_count INTEGER,
+        backup_type VARCHAR(50) NOT NULL DEFAULT 'manual', -- manual, auto, scheduled
+        status VARCHAR(50) NOT NULL DEFAULT 'completed', -- pending, in_progress, completed, failed
+        created_by INTEGER REFERENCES users(id),
+        restored_by INTEGER REFERENCES users(id),
+        restored_at TIMESTAMP,
+        expires_at TIMESTAMP,
+        metadata JSONB,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
     // 插入默認設置
     const defaultSettings = [
       { key: 'system_name', value: '台灣房東系統', category: 'general', description: '系統名稱' },
@@ -1130,6 +1149,353 @@ app.get(`${API_PREFIX}/settings/:category`, authenticate, async (req, res) => {
       success: false,
       error: '伺服器錯誤',
       message: '獲取設置失敗'
+    });
+  }
+});
+
+// ==================== 數據備份 API ====================
+
+// 創建數據備份（管理員以上）
+app.post(`${API_PREFIX}/backup`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '備份名稱不能為空'
+      });
+    }
+    
+    // 開始創建備份記錄
+    const backupResult = await pool.query(
+      `INSERT INTO backup_logs (name, description, backup_type, status, created_by, expires_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP + INTERVAL '30 days')
+       RETURNING id, name, description, backup_type, status, created_at`,
+      [name, description || '手動備份', 'manual', 'completed', req.user.userId]
+    );
+    
+    const backup = backupResult.rows[0];
+    
+    // 這裡應該實際執行數據庫備份操作
+    // 由於這是簡化版本，我們只記錄備份請求
+    
+    // 記錄操作日誌
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [req.user.userId, 'create', 'backup', backup.id, 
+       JSON.stringify({ name, description, type: 'manual' })]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        backup,
+        message: '備份創建成功（模擬）',
+        note: '在實際環境中，這裡會執行完整的數據庫備份'
+      },
+      message: '備份請求已提交'
+    });
+    
+  } catch (error) {
+    console.error('創建備份錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '創建備份失敗'
+    });
+  }
+});
+
+// 獲取備份列表（管理員以上）
+app.get(`${API_PREFIX}/backups`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { status, type, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    let query = `
+      SELECT bl.*, 
+             u1.username as created_by_username,
+             u2.username as restored_by_username
+      FROM backup_logs bl
+      LEFT JOIN users u1 ON bl.created_by = u1.id
+      LEFT JOIN users u2 ON bl.restored_by = u2.id
+    `;
+    
+    let conditions = [];
+    let params = [];
+    let paramCount = 0;
+    
+    if (status) {
+      paramCount++;
+      conditions.push(`bl.status = $${paramCount}`);
+      params.push(status);
+    }
+    
+    if (type) {
+      paramCount++;
+      conditions.push(`bl.backup_type = $${paramCount}`);
+      params.push(type);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY bl.created_at DESC';
+    query += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+    
+    // 執行查詢
+    const result = await pool.query(query, params);
+    
+    // 獲取總數
+    let countQuery = 'SELECT COUNT(*) as total FROM backup_logs bl';
+    if (conditions.length > 0) {
+      countQuery += ' WHERE ' + conditions.join(' AND ');
+    }
+    const countResult = await pool.query(countQuery, params.slice(0, paramCount));
+    const total = parseInt(countResult.rows[0].total);
+    
+    // 統計信息
+    const statsResult = await pool.query(`
+      SELECT 
+        COUNT(*) as total_backups,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_backups,
+        COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_backups,
+        COUNT(CASE WHEN restored_at IS NOT NULL THEN 1 END) as restored_backups,
+        COALESCE(SUM(file_size), 0) as total_size
+      FROM backup_logs
+    `);
+    
+    const stats = statsResult.rows[0];
+    
+    res.json({
+      success: true,
+      data: {
+        backups: result.rows,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          totalPages: Math.ceil(total / limit)
+        },
+        stats
+      },
+      message: '獲取備份列表成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取備份列表錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取備份列表失敗'
+    });
+  }
+});
+
+// 恢復備份（管理員以上）
+app.post(`${API_PREFIX}/backups/:id/restore`, authenticate, authorize('super_admin'), async (req, res) => {
+  try {
+    const backupId = parseInt(req.params.id);
+    
+    if (!backupId || isNaN(backupId)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '備份ID無效'
+      });
+    }
+    
+    // 檢查備份是否存在
+    const backupCheck = await pool.query(
+      `SELECT id, name, status FROM backup_logs WHERE id = $1`,
+      [backupId]
+    );
+    
+    if (backupCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: '備份不存在',
+        message: '找不到指定的備份'
+      });
+    }
+    
+    const backup = backupCheck.rows[0];
+    
+    // 檢查備份狀態
+    if (backup.status !== 'completed') {
+      return res.status(400).json({
+        success: false,
+        error: '操作不允許',
+        message: '只能恢復已完成的備份'
+      });
+    }
+    
+    // 更新備份記錄
+    const updateResult = await pool.query(
+      `UPDATE backup_logs 
+       SET restored_by = $1, restored_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING id, name, restored_at`,
+      [req.user.userId, backupId]
+    );
+    
+    const updatedBackup = updateResult.rows[0];
+    
+    // 記錄操作日誌
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [req.user.userId, 'restore', 'backup', backupId, 
+       JSON.stringify({ backup_name: backup.name })]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        backup: updatedBackup,
+        message: '恢復請求已提交（模擬）',
+        warning: '在實際環境中，這裡會執行完整的數據庫恢復操作',
+        note: '恢復操作可能需要幾分鐘時間，請勿關閉頁面'
+      },
+      message: '備份恢復請求已提交'
+    });
+    
+  } catch (error) {
+    console.error('恢復備份錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '恢復備份失敗'
+    });
+  }
+});
+
+// 刪除備份（超級管理員）
+app.delete(`${API_PREFIX}/backups/:id`, authenticate, authorize('super_admin'), async (req, res) => {
+  try {
+    const backupId = parseInt(req.params.id);
+    
+    if (!backupId || isNaN(backupId)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '備份ID無效'
+      });
+    }
+    
+    // 檢查備份是否存在
+    const backupCheck = await pool.query(
+      `SELECT id, name FROM backup_logs WHERE id = $1`,
+      [backupId]
+    );
+    
+    if (backupCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: '備份不存在',
+        message: '找不到指定的備份'
+      });
+    }
+    
+    const backup = backupCheck.rows[0];
+    
+    // 刪除備份記錄
+    await pool.query(
+      'DELETE FROM backup_logs WHERE id = $1',
+      [backupId]
+    );
+    
+    // 記錄操作日誌
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [req.user.userId, 'delete', 'backup', backupId, 
+       JSON.stringify({ backup_name: backup.name })]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        deleted_id: backupId,
+        backup_name: backup.name
+      },
+      message: '備份已刪除'
+    });
+    
+  } catch (error) {
+    console.error('刪除備份錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '刪除備份失敗'
+    });
+  }
+});
+
+// 獲取備份統計信息（管理員以上）
+app.get(`${API_PREFIX}/backups/stats`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const statsResult = await pool.query(`
+      SELECT 
+        -- 總體統計
+        COUNT(*) as total_backups,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_backups,
+        COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_backups,
+        COUNT(CASE WHEN restored_at IS NOT NULL THEN 1 END) as restored_backups,
+        COALESCE(SUM(file_size), 0) as total_size_bytes,
+        
+        -- 類型統計
+        COUNT(CASE WHEN backup_type = 'manual' THEN 1 END) as manual_backups,
+        COUNT(CASE WHEN backup_type = 'auto' THEN 1 END) as auto_backups,
+        COUNT(CASE WHEN backup_type = 'scheduled' THEN 1 END) as scheduled_backups,
+        
+        -- 時間統計
+        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '7 days' THEN 1 END) as last_7_days,
+        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as last_30_days,
+        
+        -- 最近備份
+        MAX(created_at) as last_backup_time,
+        MIN(created_at) as first_backup_time
+        
+      FROM backup_logs
+    `);
+    
+    const stats = statsResult.rows[0];
+    
+    // 計算人類可讀的大小
+    const formatSize = (bytes: number) => {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+      if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+      return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    };
+    
+    const formattedStats = {
+      ...stats,
+      total_size: formatSize(parseInt(stats.total_size_bytes)),
+      last_backup_time: stats.last_backup_time ? new Date(stats.last_backup_time).toISOString() : null,
+      first_backup_time: stats.first_backup_time ? new Date(stats.first_backup_time).toISOString() : null
+    };
+    
+    res.json({
+      success: true,
+      data: {
+        stats: formattedStats
+      },
+      message: '獲取備份統計成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取備份統計錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取備份統計失敗'
     });
   }
 });
