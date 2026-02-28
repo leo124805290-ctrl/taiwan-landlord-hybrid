@@ -142,6 +142,27 @@ async function initializeDatabase() {
       )
     `);
     
+    // 創建 notifications 表（系統通知）
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        title VARCHAR(200) NOT NULL,
+        message TEXT NOT NULL,
+        notification_type VARCHAR(50) NOT NULL DEFAULT 'system', -- system, user, alert, reminder
+        priority VARCHAR(20) NOT NULL DEFAULT 'medium', -- low, medium, high, urgent
+        status VARCHAR(20) NOT NULL DEFAULT 'unread', -- unread, read, dismissed, archived
+        action_url TEXT,
+        action_label VARCHAR(100),
+        metadata JSONB,
+        expires_at TIMESTAMP,
+        read_at TIMESTAMP,
+        created_by INTEGER REFERENCES users(id),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
     // 插入默認設置
     const defaultSettings = [
       { key: 'system_name', value: '台灣房東系統', category: 'general', description: '系統名稱' },
@@ -1945,7 +1966,535 @@ app.get(`${API_PREFIX}/logs/export`, authenticate, authorize('admin', 'super_adm
   }
 });
 
-// ==================== 404 處理 ====================
+// ==================== 通知系統 API ====================
+
+// 創建通知（管理員以上）
+app.post(`${API_PREFIX}/notifications`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { 
+      user_id, 
+      title, 
+      message, 
+      notification_type = 'system', 
+      priority = 'medium',
+      action_url,
+      action_label,
+      metadata,
+      expires_at 
+    } = req.body;
+    
+    if (!title || !message) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '通知標題和內容不能為空'
+      });
+    }
+    
+    // 創建通知
+    const notificationResult = await pool.query(
+      `INSERT INTO notifications (
+        user_id, title, message, notification_type, priority, 
+        action_url, action_label, metadata, expires_at, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING id, title, message, notification_type, priority, status, created_at`,
+      [
+        user_id || null, // null 表示系統通知，所有用戶可見
+        title,
+        message,
+        notification_type,
+        priority,
+        action_url || null,
+        action_label || null,
+        metadata ? JSON.stringify(metadata) : null,
+        expires_at || null,
+        req.user.userId
+      ]
+    );
+    
+    const notification = notificationResult.rows[0];
+    
+    // 記錄操作日誌
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [req.user.userId, 'create', 'notification', notification.id, 
+       JSON.stringify({ 
+         title, 
+         notification_type, 
+         priority,
+         target_user: user_id ? 'specific' : 'all'
+       })]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        notification,
+        message: user_id ? '個人通知已發送' : '系統通知已創建'
+      },
+      message: '通知創建成功'
+    });
+    
+  } catch (error) {
+    console.error('創建通知錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '創建通知失敗'
+    });
+  }
+});
+
+// 獲取用戶通知
+app.get(`${API_PREFIX}/notifications`, authenticate, async (req, res) => {
+  try {
+    const { 
+      status, 
+      type, 
+      priority, 
+      unread_only = 'false',
+      page = 1, 
+      limit = 20 
+    } = req.query;
+    
+    const offset = (page - 1) * limit;
+    const userId = req.user.userId;
+    
+    let query = `
+      SELECT n.*, u.username as created_by_username
+      FROM notifications n
+      LEFT JOIN users u ON n.created_by = u.id
+      WHERE (n.user_id IS NULL OR n.user_id = $1)
+    `;
+    
+    let conditions = [];
+    let params = [userId];
+    let paramCount = 1;
+    
+    if (status) {
+      paramCount++;
+      conditions.push(`n.status = $${paramCount}`);
+      params.push(status);
+    }
+    
+    if (type) {
+      paramCount++;
+      conditions.push(`n.notification_type = $${paramCount}`);
+      params.push(type);
+    }
+    
+    if (priority) {
+      paramCount++;
+      conditions.push(`n.priority = $${paramCount}`);
+      params.push(priority);
+    }
+    
+    if (unread_only === 'true') {
+      conditions.push(`n.status = 'unread'`);
+    }
+    
+    // 過濾已過期的通知
+    conditions.push(`(n.expires_at IS NULL OR n.expires_at > CURRENT_TIMESTAMP)`);
+    
+    if (conditions.length > 0) {
+      query += ' AND ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY 
+      CASE n.priority 
+        WHEN \'urgent\' THEN 1
+        WHEN \'high\' THEN 2
+        WHEN \'medium\' THEN 3
+        WHEN \'low\' THEN 4
+      END,
+      n.created_at DESC';
+    
+    query += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
+    params.push(limit, offset);
+    
+    // 執行查詢
+    const result = await pool.query(query, params);
+    
+    // 獲取總數
+    let countQuery = `
+      SELECT COUNT(*) as total 
+      FROM notifications n
+      WHERE (n.user_id IS NULL OR n.user_id = $1)
+    `;
+    
+    if (conditions.length > 0) {
+      countQuery += ' AND ' + conditions.join(' AND ');
+    }
+    
+    const countResult = await pool.query(countQuery, params.slice(0, paramCount));
+    const total = parseInt(countResult.rows[0].total);
+    
+    // 獲取未讀通知數量
+    const unreadResult = await pool.query(`
+      SELECT COUNT(*) as unread_count
+      FROM notifications n
+      WHERE (n.user_id IS NULL OR n.user_id = $1)
+        AND n.status = 'unread'
+        AND (n.expires_at IS NULL OR n.expires_at > CURRENT_TIMESTAMP)
+    `, [userId]);
+    
+    const unreadCount = parseInt(unreadResult.rows[0].unread_count);
+    
+    // 獲取通知統計
+    const statsResult = await pool.query(`
+      SELECT 
+        COUNT(*) as total_notifications,
+        COUNT(CASE WHEN status = 'unread' THEN 1 END) as unread_notifications,
+        COUNT(CASE WHEN status = 'read' THEN 1 END) as read_notifications,
+        COUNT(CASE WHEN priority = 'urgent' THEN 1 END) as urgent_notifications,
+        COUNT(CASE WHEN priority = 'high' THEN 1 END) as high_notifications,
+        COUNT(CASE WHEN notification_type = 'system' THEN 1 END) as system_notifications,
+        COUNT(CASE WHEN notification_type = 'alert' THEN 1 END) as alert_notifications,
+        MIN(created_at) as first_notification,
+        MAX(created_at) as last_notification
+      FROM notifications
+      WHERE user_id IS NULL OR user_id = $1
+    `, [userId]);
+    
+    const stats = statsResult.rows[0];
+    
+    res.json({
+      success: true,
+      data: {
+        notifications: result.rows,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          totalPages: Math.ceil(total / limit)
+        },
+        summary: {
+          unread_count: unreadCount,
+          stats
+        }
+      },
+      message: '獲取通知成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取通知錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取通知失敗'
+    });
+  }
+});
+
+// 標記通知為已讀
+app.put(`${API_PREFIX}/notifications/:id/read`, authenticate, async (req, res) => {
+  try {
+    const notificationId = parseInt(req.params.id);
+    
+    if (!notificationId || isNaN(notificationId)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '通知ID無效'
+      });
+    }
+    
+    const userId = req.user.userId;
+    
+    // 檢查通知是否存在且屬於該用戶
+    const checkResult = await pool.query(
+      `SELECT id, title, status FROM notifications 
+       WHERE id = $1 AND (user_id IS NULL OR user_id = $2)`,
+      [notificationId, userId]
+    );
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: '通知不存在',
+        message: '找不到指定的通知或無權訪問'
+      });
+    }
+    
+    const notification = checkResult.rows[0];
+    
+    // 如果已經讀過，直接返回成功
+    if (notification.status === 'read') {
+      return res.json({
+        success: true,
+        data: { notification },
+        message: '通知已標記為已讀'
+      });
+    }
+    
+    // 更新通知狀態
+    const updateResult = await pool.query(
+      `UPDATE notifications 
+       SET status = 'read', read_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING id, title, status, read_at`,
+      [notificationId]
+    );
+    
+    const updatedNotification = updateResult.rows[0];
+    
+    res.json({
+      success: true,
+      data: {
+        notification: updatedNotification
+      },
+      message: '通知已標記為已讀'
+    });
+    
+  } catch (error) {
+    console.error('標記通知已讀錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '標記通知已讀失敗'
+    });
+  }
+});
+
+// 標記所有通知為已讀
+app.put(`${API_PREFIX}/notifications/read-all`, authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // 更新所有未讀通知
+    const updateResult = await pool.query(
+      `UPDATE notifications 
+       SET status = 'read', read_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE (user_id IS NULL OR user_id = $1) 
+         AND status = 'unread'
+         AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+       RETURNING COUNT(*) as updated_count`,
+      [userId]
+    );
+    
+    const updatedCount = parseInt(updateResult.rows[0].updated_count);
+    
+    res.json({
+      success: true,
+      data: {
+        updated_count: updatedCount
+      },
+      message: `已標記 ${updatedCount} 個通知為已讀`
+    });
+    
+  } catch (error) {
+    console.error('標記所有通知已讀錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '標記所有通知已讀失敗'
+    });
+  }
+});
+
+// 刪除通知（管理員或通知所有者）
+app.delete(`${API_PREFIX}/notifications/:id`, authenticate, async (req, res) => {
+  try {
+    const notificationId = parseInt(req.params.id);
+    
+    if (!notificationId || isNaN(notificationId)) {
+      return res.status(400).json({
+        success: false,
+        error: '參數錯誤',
+        message: '通知ID無效'
+      });
+    }
+    
+    const userId = req.user.userId;
+    const userRole = req.user.role;
+    
+    // 檢查通知是否存在
+    const checkResult = await pool.query(
+      `SELECT id, title, user_id, created_by FROM notifications WHERE id = $1`,
+      [notificationId]
+    );
+    
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: '通知不存在',
+        message: '找不到指定的通知'
+      });
+    }
+    
+    const notification = checkResult.rows[0];
+    
+    // 檢查權限：管理員或通知所有者可以刪除
+    const isAdmin = userRole === 'admin' || userRole === 'super_admin';
+    const isOwner = notification.user_id === userId;
+    const isCreator = notification.created_by === userId;
+    
+    if (!isAdmin && !isOwner && !isCreator) {
+      return res.status(403).json({
+        success: false,
+        error: '權限不足',
+        message: '無權刪除此通知'
+      });
+    }
+    
+    // 刪除通知
+    await pool.query(
+      'DELETE FROM notifications WHERE id = $1',
+      [notificationId]
+    );
+    
+    // 記錄操作日誌
+    await pool.query(
+      `INSERT INTO operation_logs (user_id, action_type, resource_type, resource_id, details)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, 'delete', 'notification', notificationId, 
+       JSON.stringify({ title: notification.title })]
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        deleted_id: notificationId,
+        title: notification.title
+      },
+      message: '通知已刪除'
+    });
+    
+  } catch (error) {
+    console.error('刪除通知錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '刪除通知失敗'
+    });
+  }
+});
+
+// 獲取通知統計（管理員以上）
+app.get(`${API_PREFIX}/notifications/stats`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const statsResult = await pool.query(`
+      SELECT 
+        -- 總體統計
+        COUNT(*) as total_notifications,
+        COUNT(CASE WHEN status = 'unread' THEN 1 END) as unread_notifications,
+        COUNT(CASE WHEN status = 'read' THEN 1 END) as read_notifications,
+        COUNT(CASE WHEN status = 'dismissed' THEN 1 END) as dismissed_notifications,
+        
+        -- 類型統計
+        COUNT(CASE WHEN notification_type = 'system' THEN 1 END) as system_notifications,
+        COUNT(CASE WHEN notification_type = 'user' THEN 1 END) as user_notifications,
+        COUNT(CASE WHEN notification_type = 'alert' THEN 1 END) as alert_notifications,
+        COUNT(CASE WHEN notification_type = 'reminder' THEN 1 END) as reminder_notifications,
+        
+        -- 優先級統計
+        COUNT(CASE WHEN priority = 'urgent' THEN 1 END) as urgent_notifications,
+        COUNT(CASE WHEN priority = 'high' THEN 1 END) as high_notifications,
+        COUNT(CASE WHEN priority = 'medium' THEN 1 END) as medium_notifications,
+        COUNT(CASE WHEN priority = 'low' THEN 1 END) as low_notifications,
+        
+        -- 時間統計
+        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '24 hours' THEN 1 END) as last_24h,
+        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '7 days' THEN 1 END) as last_7d,
+        COUNT(CASE WHEN created_at >= CURRENT_DATE - INTERVAL '30 days' THEN 1 END) as last_30d,
+        
+        -- 用戶統計
+        COUNT(DISTINCT user_id) as users_with_notifications,
+        COUNT(DISTINCT created_by) as notification_creators,
+        
+        -- 最近通知
+        MAX(created_at) as last_notification_time,
+        MIN(created_at) as first_notification_time
+        
+      FROM notifications
+    `);
+    
+    const stats = statsResult.rows[0];
+    
+    // 最近7天通知趨勢
+    const trendResult = await pool.query(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as count,
+        COUNT(CASE WHEN status = 'unread' THEN 1 END) as unread_count,
+        COUNT(CASE WHEN priority = 'urgent' THEN 1 END) as urgent_count
+      FROM notifications
+      WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+      GROUP BY DATE(created_at)
+      ORDER BY date DESC
+    `);
+    
+    const trend = trendResult.rows;
+    
+    res.json({
+      success: true,
+      data: {
+        stats,
+        trend
+      },
+      message: '獲取通知統計成功'
+    });
+    
+  } catch (error) {
+    console.error('獲取通知統計錯誤:', error);
+    res.status(500).json({
+      success: false,
+      error: '伺服器錯誤',
+      message: '獲取通知統計失敗'
+    });
+  }
+});
+
+// 發送測試通知（管理員以上）
+app.post(`${API_PREFIX}/notifications/test`, authenticate, authorize('admin', 'super_admin'), async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    // 創建測試通知
+    const testNotifications = [
+      {
+        title: '系統維護通知',
+        message: '系統將於今晚 23:00-01:00 進行維護，期間可能無法訪問。',
+        notification_type: 'system',
+        priority: 'medium'
+      },
+      {
+        title: '安全警報',
+        message: '檢測到異常登入嘗試，請檢查您的帳戶安全。',
+        notification_type: 'alert',
+        priority: 'high'
+      },
+      {
+        title: '歡迎使用新功能',
+        message: '通知系統已上線！您可以在這裡查看所有系統通知。',
+        notification_type: 'user',
+        priority: 'low'
+      }
+    ];
+    
+    const createdNotifications = [];
+    
+    for (const notification of testNotifications) {
+      const result = await pool.query(
+        `INSERT INTO notifications (
+          user_id, title, message, notification_type, priority, created_by
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, title, message, notification_type, priority, status, created_at`,
+        [
+          userId,
+          notification.title,
+          notification.message,
+          notification.notification_type,
+          notification.priority,
+          userId
+        ]
+      );
+      
+      createdNotifications.push(result.rows[0]);
+    }
+    
+    //
 app.use((req, res) => {
   res.status(404).json({
     success: false,
